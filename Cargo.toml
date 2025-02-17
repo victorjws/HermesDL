@@ -1,0 +1,17 @@
+[package]
+name = "HermesDL"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { version = "1" }
+bytes = "1.9.0"
+futures = "0"
+futures-core = "0.3.31"
+reqwest = { version = "0", features = ["json", "h2", "stream", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0"
+url = "2"
+warp = "0"
