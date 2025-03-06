@@ -38,8 +38,12 @@ impl Downloader {
         }
     }
 
-    pub async fn download_file(&self, url: &str) -> Result<()> {
-        let head_response = self.client.head(url, None).await?;
+    pub async fn download_file(
+        &self,
+        url: &str,
+        headers: Option<&HashMap<String, String>>,
+    ) -> Result<()> {
+        let head_response = self.client.head(url, headers).await?;
         let content_type = head_response.content_type();
         let filename = self.get_filename(&head_response, url);
 
@@ -56,7 +60,7 @@ impl Downloader {
                 filename.to_string()
             };
 
-            let get_response = self.client.get(url, None).await?;
+            let get_response = self.client.get(url, headers).await?;
             let base_url = Url::parse(url)?;
             let playlist: Vec<String> = get_response
                 .text()
@@ -64,7 +68,7 @@ impl Downloader {
                 .unwrap_or_default()
                 .lines()
                 .filter_map(|line| {
-                    if line.ends_with(".ts") {
+                    if (!line.starts_with("#")) && line.contains(".") {
                         let ts_url = if let Ok(absolute_url) = Url::parse(line) {
                             Some(absolute_url.to_string())
                         } else {
@@ -79,7 +83,8 @@ impl Downloader {
                 .collect();
 
             let segments = self.get_segments_info(playlist).await?;
-            self.download_parallel(segments, &filename, false).await?;
+            self.download_parallel(segments, headers, &filename, false)
+                .await?;
         } else {
             // normal file
             let content_length = head_response.content_length();
@@ -95,7 +100,8 @@ impl Downloader {
                         let segment = Segment::new(url_arc.clone(), offset, end);
                         segments.push(segment);
                     }
-                    self.download_parallel(segments, &filename, true).await?;
+                    self.download_parallel(segments, headers, &filename, true)
+                        .await?;
                 }
                 _ => self.download_full(url, &filename).await?,
             }
@@ -185,6 +191,7 @@ impl Downloader {
     async fn download_parallel(
         &self,
         segments: Vec<Segment>,
+        default_headers: Option<&HashMap<String, String>>,
         output_path: &str,
         accept_ranges: bool,
     ) -> Result<()> {
@@ -206,10 +213,15 @@ impl Downloader {
             let segment = segment.clone();
             let self_clone = self.clone();
             let total = segments.len();
+            let default_headers = default_headers.cloned();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
-                let mut headers = HashMap::new();
+                let mut headers = if default_headers.is_some() {
+                    default_headers.unwrap().clone()
+                } else {
+                    HashMap::<String, String>::new()
+                };
                 if accept_ranges {
                     headers.insert("Range".to_string(), segment.get_range_header());
                 }
