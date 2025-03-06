@@ -128,7 +128,7 @@ impl Downloader {
         };
 
         let mut path = PathBuf::from(&filename);
-        let parent = Path::new("../");
+        let parent = Path::new("../files");
 
         let mut count = 1;
         while path.exists() {
@@ -199,7 +199,7 @@ impl Downloader {
             tokio::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
-                .open(output_path)
+                .open("files/".to_owned() + output_path)
                 .await?,
         ));
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
