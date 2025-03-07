@@ -1,7 +1,6 @@
-use crate::downloader::segment::Segment;
-use crate::request::client::Client;
-use crate::request::response::Response;
-use crate::request::user_agent::UserAgent;
+use super::progress::{ProgressBar, ProgressManager};
+use super::segment::Segment;
+use crate::request::{client::Client, response::Response, user_agent::UserAgent};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures_core::Stream;
@@ -13,7 +12,7 @@ use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::SeekFrom;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio_stream::StreamExt;
 use url::Url;
 
@@ -43,10 +42,10 @@ impl Downloader {
         url: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> Result<()> {
-        println!("Start Download {}", url);
         let head_response = self.client.head(url, headers).await?;
         let content_type = head_response.content_type();
         let filename = self.get_filename(&head_response, url);
+        let progress_manager = Arc::new(ProgressManager::new(filename.clone()));
 
         if url.ends_with(".m3u8")
             || content_type
@@ -60,6 +59,11 @@ impl Downloader {
             } else {
                 filename.to_string()
             };
+            progress_manager
+                .main_progress_bar
+                .write()
+                .await
+                .set_name(filename.clone());
 
             let get_response = self.client.get(url, headers).await?;
             let base_url = Url::parse(url)?;
@@ -84,8 +88,22 @@ impl Downloader {
                 .collect();
 
             let segments = self.get_segments_info(playlist).await?;
-            self.download_parallel(segments, headers, &filename, false)
-                .await?;
+            let total_size: u64 = segments.iter().map(|s| s.end - s.start + 1).sum();
+
+            progress_manager
+                .main_progress_bar
+                .read()
+                .await
+                .set_length(total_size);
+
+            self.download_parallel(
+                segments,
+                headers,
+                &filename,
+                false,
+                progress_manager.clone(),
+            )
+            .await?;
         } else {
             // normal file
             let content_length = head_response.content_length();
@@ -93,6 +111,12 @@ impl Downloader {
 
             match (content_length, accept_ranges) {
                 (Some(content_length), Some(accept_ranges)) if accept_ranges == "bytes" => {
+                    progress_manager
+                        .main_progress_bar
+                        .read()
+                        .await
+                        .set_length(content_length);
+
                     let url_arc = Arc::new(url.to_string());
                     let mut segments = Vec::new();
 
@@ -101,14 +125,24 @@ impl Downloader {
                         let segment = Segment::new(url_arc.clone(), offset, end);
                         segments.push(segment);
                     }
-                    self.download_parallel(segments, headers, &filename, true)
-                        .await?;
+                    self.download_parallel(
+                        segments,
+                        headers,
+                        &filename,
+                        true,
+                        progress_manager.clone(),
+                    )
+                    .await?;
                 }
-                _ => self.download_full(url, &filename).await?,
+                _ => {
+                    self.download_full(url, &filename, progress_manager.clone())
+                        .await?
+                }
             }
         }
 
-        println!("Download finish");
+        progress_manager.main_progress_bar.read().await.finish();
+
         Ok(())
     }
 
@@ -196,6 +230,7 @@ impl Downloader {
         default_headers: Option<&HashMap<String, String>>,
         output_path: &str,
         accept_ranges: bool,
+        progress_manager: Arc<ProgressManager>,
     ) -> Result<()> {
         let file = Arc::new(Mutex::new(
             tokio::fs::OpenOptions::new()
@@ -209,13 +244,18 @@ impl Downloader {
         let mut handles = vec![];
 
         for (index, segment) in segments.iter().enumerate() {
-            let client = self.client.clone();
-            let file = Arc::clone(&file);
-            let permit = semaphore.clone().acquire_owned().await?;
-            let segment = segment.clone();
             let self_clone = self.clone();
+            let client = self.client.clone();
+            let segment = segment.clone();
             let total = segments.len();
             let default_headers = default_headers.cloned();
+            let main_progress_bar = progress_manager.main_progress_bar.clone();
+            let progress_bar = progress_manager.create_new_progress_bar(
+                segment.end - segment.start + 1,
+                format!("{}/{}", index + 1, total),
+            );
+            let permit = semaphore.clone().acquire_owned().await?;
+            let file = Arc::clone(&file);
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -227,10 +267,16 @@ impl Downloader {
                 if accept_ranges {
                     headers.insert("Range".to_string(), segment.get_range_header());
                 }
-                println!("{}/{total}", index + 1);
 
                 self_clone
-                    .retryable_get_segment(&client, &file, &segment, &headers)
+                    .retryable_get_segment(
+                        &client,
+                        &file,
+                        &segment,
+                        &headers,
+                        main_progress_bar,
+                        progress_bar,
+                    )
                     .await
                     .ok()
             });
@@ -251,12 +297,24 @@ impl Downloader {
         file: &Arc<Mutex<File>>,
         segment: &Segment,
         headers: &HashMap<String, String>,
+        global_progress_bar: Arc<RwLock<ProgressBar>>,
+        local_progress_bar: ProgressBar,
     ) -> Result<()> {
         let max_retries = 3;
         let mut attempts = 0;
 
         while attempts < max_retries {
-            match self.get_segment(client, file, segment, headers).await {
+            match self
+                .get_segment(
+                    client,
+                    file,
+                    segment,
+                    headers,
+                    global_progress_bar.clone(),
+                    &local_progress_bar,
+                )
+                .await
+            {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     eprintln!(
@@ -284,11 +342,19 @@ impl Downloader {
         file: &Arc<Mutex<File>>,
         segment: &Segment,
         headers: &HashMap<String, String>,
+        global_progress_bar: Arc<RwLock<ProgressBar>>,
+        local_progress_bar: &ProgressBar,
     ) -> Result<()> {
         match client.get(&segment.url, Some(&headers)).await {
             Ok(response) => {
-                self.write_segment(response.bytes_stream(), file, segment.start)
-                    .await?;
+                self.write_segment(
+                    response.bytes_stream(),
+                    file,
+                    segment.start,
+                    global_progress_bar,
+                    local_progress_bar,
+                )
+                .await?;
                 Ok(())
             }
             Err(e) => Err(anyhow!(
@@ -306,6 +372,8 @@ impl Downloader {
         mut stream: impl Stream<Item = Result<Bytes>> + Unpin,
         file: &Arc<Mutex<File>>,
         start: u64,
+        global_progress_bar: Arc<RwLock<ProgressBar>>,
+        local_progress_bar: &ProgressBar,
     ) -> Result<()> {
         let mut file = file.lock().await;
         let offset = start;
@@ -314,16 +382,27 @@ impl Downloader {
         while let Some(chunk) = stream.next().await {
             if let Ok(chunk) = chunk {
                 file.write_all(&chunk).await?;
+                local_progress_bar.increase(chunk.len() as u64);
+                global_progress_bar
+                    .read()
+                    .await
+                    .increase(chunk.len() as u64);
             } else {
                 return Err(anyhow!("Failed to download segment {}", offset));
             }
         }
 
         file.flush().await?;
+        local_progress_bar.finish_and_clear();
         Ok(())
     }
 
-    async fn download_full(&self, url: &str, output_path: &str) -> Result<()> {
+    async fn download_full(
+        &self,
+        url: &str,
+        output_path: &str,
+        progress_manager: Arc<ProgressManager>,
+    ) -> Result<()> {
         let response = self.client.get(url, None).await?;
         let mut file = File::create(output_path).await?;
         let mut stream = response.bytes_stream();
@@ -331,6 +410,11 @@ impl Downloader {
         while let Some(chunk) = stream.next().await {
             if let Ok(chunk) = chunk {
                 file.write_all(&chunk).await?;
+                progress_manager
+                    .main_progress_bar
+                    .read()
+                    .await
+                    .increase(chunk.len() as u64);
             } else {
                 return Err(anyhow!("Failed to write file: {}", output_path));
             }
