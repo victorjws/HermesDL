@@ -3,6 +3,11 @@ name = "HermesDL"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["unix"]
+unix = []
+windows = []
+
 [dependencies]
 async-compression = { version = "0", features = ["tokio", "all-algorithms"] }
 anyhow = { version = "1" }

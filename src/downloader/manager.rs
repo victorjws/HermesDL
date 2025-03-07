@@ -7,14 +7,19 @@ use futures_core::Stream;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::SeekFrom;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use tokio_stream::StreamExt;
 use url::Url;
+
+#[cfg(feature = "unix")]
+use std::os::unix::fs::FileExt;
+
+#[cfg(feature = "windows")]
+use std::os::windows::fs::FileExt;
 
 #[derive(Clone, Debug)]
 pub struct Downloader {
@@ -232,13 +237,12 @@ impl Downloader {
         accept_ranges: bool,
         progress_manager: Arc<ProgressManager>,
     ) -> Result<()> {
-        let file = Arc::new(Mutex::new(
-            tokio::fs::OpenOptions::new()
+        let file = Arc::new(
+            OpenOptions::new()
                 .create(true)
                 .write(true)
-                .open("files/".to_owned() + output_path)
-                .await?,
-        ));
+                .open("files/".to_owned() + output_path)?,
+        );
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent));
 
         let mut handles = vec![];
@@ -294,7 +298,7 @@ impl Downloader {
     async fn retryable_get_segment(
         &self,
         client: &Client,
-        file: &Arc<Mutex<File>>,
+        file: &Arc<File>,
         segment: &Segment,
         headers: &HashMap<String, String>,
         global_progress_bar: Arc<RwLock<ProgressBar>>,
@@ -339,7 +343,7 @@ impl Downloader {
     async fn get_segment(
         &self,
         client: &Client,
-        file: &Arc<Mutex<File>>,
+        file: &Arc<File>,
         segment: &Segment,
         headers: &HashMap<String, String>,
         global_progress_bar: Arc<RwLock<ProgressBar>>,
@@ -370,29 +374,28 @@ impl Downloader {
     async fn write_segment(
         &self,
         mut stream: impl Stream<Item = Result<Bytes>> + Unpin,
-        file: &Arc<Mutex<File>>,
+        file: &Arc<File>,
         start: u64,
         global_progress_bar: Arc<RwLock<ProgressBar>>,
         local_progress_bar: &ProgressBar,
     ) -> Result<()> {
-        let mut file = file.lock().await;
-        let offset = start;
-        file.seek(SeekFrom::Start(offset)).await?;
+        // let mut file = file.lock().await;
+        let mut offset = start;
+        // file.seek(SeekFrom::Start(offset)).await?;
 
         while let Some(chunk) = stream.next().await {
             if let Ok(chunk) = chunk {
-                file.write_all(&chunk).await?;
-                local_progress_bar.increase(chunk.len() as u64);
-                global_progress_bar
-                    .read()
-                    .await
-                    .increase(chunk.len() as u64);
+                file.write_at(&chunk, offset)?;
+                let len = chunk.len() as u64;
+                local_progress_bar.increase(len);
+                global_progress_bar.read().await.increase(len);
+                offset += len;
             } else {
                 return Err(anyhow!("Failed to download segment {}", offset));
             }
         }
 
-        file.flush().await?;
+        file.sync_all()?;
         local_progress_bar.finish_and_clear();
         Ok(())
     }
@@ -404,23 +407,26 @@ impl Downloader {
         progress_manager: Arc<ProgressManager>,
     ) -> Result<()> {
         let response = self.client.get(url, None).await?;
-        let mut file = File::create(output_path).await?;
+        let file = File::create(output_path)?;
         let mut stream = response.bytes_stream();
+        let mut offset = 0u64;
 
         while let Some(chunk) = stream.next().await {
             if let Ok(chunk) = chunk {
-                file.write_all(&chunk).await?;
+                file.write_at(&chunk, offset)?;
+                let len = chunk.len() as u64;
                 progress_manager
                     .main_progress_bar
                     .read()
                     .await
-                    .increase(chunk.len() as u64);
+                    .increase(len);
+                offset += len;
             } else {
                 return Err(anyhow!("Failed to write file: {}", output_path));
             }
         }
 
-        file.flush().await?;
+        file.sync_all()?;
 
         Ok(())
     }
