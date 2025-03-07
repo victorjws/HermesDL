@@ -43,6 +43,7 @@ impl Downloader {
         url: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> Result<()> {
+        println!("Start Download {}", url);
         let head_response = self.client.head(url, headers).await?;
         let content_type = head_response.content_type();
         let filename = self.get_filename(&head_response, url);
@@ -107,6 +108,7 @@ impl Downloader {
             }
         }
 
+        println!("Download finish");
         Ok(())
     }
 
