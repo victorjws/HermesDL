@@ -1,11 +1,13 @@
+use crate::request::encoding::ContentDecoder;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use futures_core::Stream;
 use reqwest::header::{
-    HeaderName, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE,
+    HeaderName, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
 };
 use reqwest::Response as ReqwestResponse;
+use tokio_util::io::StreamReader;
 
 #[derive(Debug)]
 pub struct Response {
@@ -52,9 +54,22 @@ impl Response {
     }
 
     pub async fn text(self) -> Option<String> {
-        match self.inner.text().await {
-            Ok(text) => Some(text),
-            Err(_) => None,
+        if let Some(encoding) = self.get_from_header(CONTENT_ENCODING) {
+            Some(self.decompress(encoding.as_ref()).await)
+        } else {
+            match self.inner.text().await {
+                Ok(text) => Some(text),
+                Err(_) => None,
+            }
         }
+    }
+
+    async fn decompress(self, encoding: &str) -> String {
+        let decoder = encoding.parse::<ContentDecoder>().unwrap();
+        let stream = self.inner.bytes_stream().map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        });
+        let reader = StreamReader::new(stream);
+        decoder.decode(reader).await
     }
 }
